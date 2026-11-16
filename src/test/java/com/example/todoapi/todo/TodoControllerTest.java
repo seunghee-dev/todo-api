@@ -1,6 +1,13 @@
 package com.example.todoapi.todo;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.contains;
+import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.startsWith;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
@@ -22,7 +29,7 @@ import com.example.todoapi.user.User;
 import com.example.todoapi.user.UserRepository;
 
 /**
- * 인터셉터~컨트롤러~서비스~H2 DB까지 실제로 연결한 상태에서 POST /todos를 검사한다.
+ * 인터셉터~컨트롤러~서비스~H2 DB까지 실제로 연결한 상태에서 POST /todos, GET /todos를 검사한다.
  * @Transactional: 테스트가 끝나면 넣은 데이터를 롤백한다.
  */
 @SpringBootTest
@@ -129,6 +136,84 @@ class TodoControllerTest {
 				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
 
 		assertThat(todoRepository.count()).isZero();
+	}
+
+	// ===== UC-4 GET /todos =====
+
+	@Test
+	void list_noToken_returns401() throws Exception {
+		mockMvc.perform(get("/todos"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+	}
+
+	@Test
+	void list_noTodos_returnsEmptyArray() throws Exception {
+		User me = saveUser("me@test.com");
+
+		listTodos(me, "")
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$").isArray())
+				.andExpect(jsonPath("$", hasSize(0)));
+	}
+
+	@Test
+	void list_returnsOnlyMyTodos() throws Exception {
+		User me = saveUser("me@test.com");
+		User other = saveUser("other@test.com");
+		todoRepository.save(new Todo(me, "내 할 일 1"));
+		todoRepository.save(new Todo(other, "남의 할 일 1"));
+		todoRepository.save(new Todo(me, "내 할 일 2"));
+		todoRepository.save(new Todo(other, "남의 할 일 2"));
+
+		listTodos(me, "")
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$", hasSize(2)))
+				.andExpect(jsonPath("$[*].title", containsInAnyOrder("내 할 일 1", "내 할 일 2")))
+				.andExpect(jsonPath("$[*].title", not(hasItem(startsWith("남의")))))
+				// 사용자 정보(비밀번호 해시 포함)는 응답에 실리지 않는다.
+				.andExpect(jsonPath("$[0].user").doesNotExist())
+				.andExpect(jsonPath("$[0].password").doesNotExist());
+	}
+
+	@Test
+	void list_otherUserIdInQuery_isIgnored() throws Exception {
+		User me = saveUser("me@test.com");
+		User other = saveUser("other@test.com");
+		todoRepository.save(new Todo(me, "내 할 일"));
+		todoRepository.save(new Todo(other, "남의 할 일"));
+
+		// 주소에 남의 id를 넣어도 토큰의 사용자(me) 것만 나와야 한다.
+		listTodos(me, "?userId=" + other.getId())
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$", hasSize(1)))
+				.andExpect(jsonPath("$[0].title").value("내 할 일"));
+	}
+
+	@Test
+	void list_sortedNewestFirst() throws Exception {
+		User me = saveUser("me@test.com");
+		todoRepository.save(new Todo(me, "첫째"));
+		todoRepository.save(new Todo(me, "둘째"));
+		todoRepository.save(new Todo(me, "셋째"));
+
+		listTodos(me, "")
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$[*].title", contains("셋째", "둘째", "첫째")));
+	}
+
+	@Test
+	void list_tokenUserNotInDb_returns401() throws Exception {
+		String token = jwtTokenProvider.createToken(999_999L);
+
+		mockMvc.perform(get("/todos").header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+	}
+
+	private ResultActions listTodos(User user, String query) throws Exception {
+		String token = jwtTokenProvider.createToken(user.getId());
+		return mockMvc.perform(get("/todos" + query).header(HttpHeaders.AUTHORIZATION, "Bearer " + token));
 	}
 
 	private User saveUser(String email) {
