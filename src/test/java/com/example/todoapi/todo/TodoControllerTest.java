@@ -7,8 +7,11 @@ import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.patch;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -28,8 +31,10 @@ import com.example.todoapi.auth.JwtTokenProvider;
 import com.example.todoapi.user.User;
 import com.example.todoapi.user.UserRepository;
 
+import jakarta.persistence.EntityManager;
+
 /**
- * 인터셉터~컨트롤러~서비스~H2 DB까지 실제로 연결한 상태에서 POST /todos, GET /todos를 검사한다.
+ * 인터셉터~컨트롤러~서비스~H2 DB까지 실제로 연결한 상태에서 POST/GET /todos, PATCH/DELETE /todos/{id}를 검사한다.
  * @Transactional: 테스트가 끝나면 넣은 데이터를 롤백한다.
  */
 @SpringBootTest
@@ -48,6 +53,9 @@ class TodoControllerTest {
 
 	@Autowired
 	private JwtTokenProvider jwtTokenProvider;
+
+	@Autowired
+	private EntityManager entityManager;
 
 	@Test
 	void noToken_returns401() throws Exception {
@@ -209,6 +217,221 @@ class TodoControllerTest {
 		mockMvc.perform(get("/todos").header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
 				.andExpect(status().isUnauthorized())
 				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+	}
+
+	// ===== UC-5 PATCH /todos/{id}, DELETE /todos/{id} =====
+
+	@Test
+	void patch_myTodo_changesTrueAndFalse() throws Exception {
+		User me = saveUser("me@test.com");
+		Todo todo = todoRepository.save(new Todo(me, "우유 사기"));
+
+		patchTodo(me, todo.getId(), "{\"completed\":true}")
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.id").value(todo.getId()))
+				.andExpect(jsonPath("$.title").value("우유 사기"))
+				.andExpect(jsonPath("$.completed").value(true))
+				.andExpect(jsonPath("$.user").doesNotExist());
+		assertThat(reloadFromDb(todo.getId()).isCompleted()).isTrue();
+
+		patchTodo(me, todo.getId(), "{\"completed\":false}")
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.completed").value(false));
+		assertThat(reloadFromDb(todo.getId()).isCompleted()).isFalse();
+	}
+
+	@Test
+	void patch_otherUsersTodo_returns404AndDbUnchanged() throws Exception {
+		User me = saveUser("me@test.com");
+		User other = saveUser("other@test.com");
+		Todo othersTodo = todoRepository.save(new Todo(other, "남의 할 일"));
+
+		patchTodo(me, othersTodo.getId(), "{\"completed\":true}")
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.status").value(404))
+				.andExpect(jsonPath("$.message").value(TodoService.TODO_NOT_FOUND_MESSAGE));
+
+		Todo reloaded = reloadFromDb(othersTodo.getId());
+		assertThat(reloaded.isCompleted()).isFalse();
+		assertThat(reloaded.getTitle()).isEqualTo("남의 할 일");
+		assertThat(reloaded.getUser().getId()).isEqualTo(other.getId());
+	}
+
+	@Test
+	void delete_otherUsersTodo_returns404AndStillInDb() throws Exception {
+		User me = saveUser("me@test.com");
+		User other = saveUser("other@test.com");
+		Todo othersTodo = todoRepository.save(new Todo(other, "남의 할 일"));
+
+		deleteTodo(me, othersTodo.getId())
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.message").value(TodoService.TODO_NOT_FOUND_MESSAGE));
+
+		Todo reloaded = reloadFromDb(othersTodo.getId());
+		assertThat(reloaded).isNotNull();
+		assertThat(reloaded.getUser().getId()).isEqualTo(other.getId());
+	}
+
+	@Test
+	void missingIdAndOthersId_returnExactlySameBody() throws Exception {
+		User me = saveUser("me@test.com");
+		User other = saveUser("other@test.com");
+		Todo othersTodo = todoRepository.save(new Todo(other, "남의 할 일"));
+		long missingId = 999_999L;
+
+		String patchMissing = patchTodo(me, missingId, "{\"completed\":true}")
+				.andExpect(status().isNotFound()).andReturn().getResponse().getContentAsString();
+		String patchOthers = patchTodo(me, othersTodo.getId(), "{\"completed\":true}")
+				.andExpect(status().isNotFound()).andReturn().getResponse().getContentAsString();
+		String deleteMissing = deleteTodo(me, missingId)
+				.andExpect(status().isNotFound()).andReturn().getResponse().getContentAsString();
+		String deleteOthers = deleteTodo(me, othersTodo.getId())
+				.andExpect(status().isNotFound()).andReturn().getResponse().getContentAsString();
+
+		// 응답만 보고는 "없는 id"인지 "남의 id"인지 알 수 없어야 한다.
+		assertThat(patchOthers).isEqualTo(patchMissing);
+		assertThat(deleteOthers).isEqualTo(deleteMissing);
+		assertThat(deleteMissing).isEqualTo(patchMissing);
+	}
+
+	@Test
+	void delete_myTodo_returns204AndRemovedFromDb() throws Exception {
+		User me = saveUser("me@test.com");
+		Todo todo = todoRepository.save(new Todo(me, "우유 사기"));
+
+		deleteTodo(me, todo.getId())
+				.andExpect(status().isNoContent())
+				.andExpect(content().string(""));
+
+		assertThat(reloadFromDb(todo.getId())).isNull();
+	}
+
+	@Test
+	void delete_alreadyDeleted_returns404() throws Exception {
+		User me = saveUser("me@test.com");
+		Todo todo = todoRepository.save(new Todo(me, "우유 사기"));
+
+		deleteTodo(me, todo.getId()).andExpect(status().isNoContent());
+		entityManager.flush();
+		entityManager.clear();
+
+		deleteTodo(me, todo.getId())
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.message").value(TodoService.TODO_NOT_FOUND_MESSAGE));
+	}
+
+	@Test
+	void patch_badBody_returns400AndDbUnchanged() throws Exception {
+		User me = saveUser("me@test.com");
+		Todo todo = todoRepository.save(new Todo(me, "우유 사기"));
+
+		// 본문 없음
+		mockMvc.perform(patch("/todos/" + todo.getId())
+				.header(HttpHeaders.AUTHORIZATION, bearer(me))
+				.contentType(MediaType.APPLICATION_JSON))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.status").value(400));
+		// 빈 문자열 본문
+		patchTodo(me, todo.getId(), "")
+				.andExpect(status().isBadRequest());
+		// completed 빠짐
+		patchTodo(me, todo.getId(), "{}")
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value("completed 값은 필수입니다."));
+		// completed가 null
+		patchTodo(me, todo.getId(), "{\"completed\":null}")
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.message").value("completed 값은 필수입니다."));
+		// 깨진 JSON
+		patchTodo(me, todo.getId(), "{broken")
+				.andExpect(status().isBadRequest());
+
+		assertThat(reloadFromDb(todo.getId()).isCompleted()).isFalse();
+	}
+
+	@Test
+	void nonNumericId_returns400() throws Exception {
+		User me = saveUser("me@test.com");
+
+		// 처리 추가 전에는 500("서버 내부 오류가 발생했습니다.")이었다.
+		patchTodo(me, "abc", "{\"completed\":true}")
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.status").value(400))
+				.andExpect(jsonPath("$.message").value("요청 값 'id'의 형식이 올바르지 않습니다."));
+		mockMvc.perform(delete("/todos/abc").header(HttpHeaders.AUTHORIZATION, bearer(me)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.status").value(400));
+	}
+
+	@Test
+	void patchAndDelete_noToken_returns401() throws Exception {
+		User me = saveUser("me@test.com");
+		Todo todo = todoRepository.save(new Todo(me, "우유 사기"));
+
+		mockMvc.perform(patch("/todos/" + todo.getId())
+				.contentType(MediaType.APPLICATION_JSON).content("{\"completed\":true}"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+		mockMvc.perform(delete("/todos/" + todo.getId()))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+
+		Todo reloaded = reloadFromDb(todo.getId());
+		assertThat(reloaded).isNotNull();
+		assertThat(reloaded.isCompleted()).isFalse();
+	}
+
+	@Test
+	void patch_tokenUserNotInDb_returns401() throws Exception {
+		User owner = saveUser("owner@test.com");
+		Todo todo = todoRepository.save(new Todo(owner, "우유 사기"));
+		String token = jwtTokenProvider.createToken(999_999L);
+
+		mockMvc.perform(patch("/todos/" + todo.getId())
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + token)
+				.contentType(MediaType.APPLICATION_JSON)
+				.content("{\"completed\":true}"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+
+		assertThat(reloadFromDb(todo.getId()).isCompleted()).isFalse();
+	}
+
+	@Test
+	void delete_tokenUserNotInDb_returns401() throws Exception {
+		User owner = saveUser("owner@test.com");
+		Todo todo = todoRepository.save(new Todo(owner, "우유 사기"));
+		String token = jwtTokenProvider.createToken(999_999L);
+
+		mockMvc.perform(delete("/todos/" + todo.getId())
+				.header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.message").value(JwtTokenProvider.UNAUTHORIZED_MESSAGE));
+
+		assertThat(reloadFromDb(todo.getId())).isNotNull();
+	}
+
+	// 1차 캐시(영속성 컨텍스트)에 남은 객체가 아니라 실제 DB 값을 읽기 위해
+	// 쌓인 변경을 DB로 보내고(flush) 캐시를 비운(clear) 뒤 다시 조회한다. 없으면 null.
+	private Todo reloadFromDb(Long id) {
+		entityManager.flush();
+		entityManager.clear();
+		return todoRepository.findById(id).orElse(null);
+	}
+
+	private String bearer(User user) {
+		return "Bearer " + jwtTokenProvider.createToken(user.getId());
+	}
+
+	private ResultActions patchTodo(User user, Object id, String json) throws Exception {
+		return mockMvc.perform(patch("/todos/" + id)
+				.header(HttpHeaders.AUTHORIZATION, bearer(user))
+				.contentType(MediaType.APPLICATION_JSON)
+				.content(json));
+	}
+
+	private ResultActions deleteTodo(User user, Object id) throws Exception {
+		return mockMvc.perform(delete("/todos/" + id).header(HttpHeaders.AUTHORIZATION, bearer(user)));
 	}
 
 	private ResultActions listTodos(User user, String query) throws Exception {

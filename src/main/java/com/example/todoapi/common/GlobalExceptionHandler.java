@@ -10,6 +10,7 @@ import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 /**
  * 모든 컨트롤러에서 빠져나온 예외를 한곳에서 받아 ApiErrorResponse(JSON)로 바꾼다.
@@ -40,6 +41,13 @@ public class GlobalExceptionHandler {
 				.map(FieldError::getDefaultMessage)
 				.orElse("입력값이 올바르지 않습니다.");
 		return toResponse(HttpStatus.BAD_REQUEST, message);
+	}
+
+	// 주소의 값이 원하는 타입으로 바뀌지 않는 경우. 예: /todos/abc ("abc"는 Long id가 될 수 없음)
+	// 이 처리가 없으면 아래 Exception 핸들러로 떨어져 500이 된다. 클라이언트가 잘못 보낸 값이므로 400으로 바꾼다.
+	@ExceptionHandler(MethodArgumentTypeMismatchException.class)
+	public ResponseEntity<ApiErrorResponse> handleTypeMismatch(MethodArgumentTypeMismatchException e) {
+		return toResponse(HttpStatus.BAD_REQUEST, "요청 값 '" + e.getName() + "'의 형식이 올바르지 않습니다.");
 	}
 
 	// 그 밖의 모든 예외.

@@ -52,8 +52,9 @@ public class Todo {
 	}
 
 	// setter 대신 의미 있는 이름의 메서드로 상태를 바꾼다.
-	public void complete() {
-		this.completed = true;
+	// 완료(true)와 미완료(false) 양쪽으로 모두 바꿀 수 있다.
+	public void changeCompleted(boolean completed) {
+		this.completed = completed;
 	}
 
 	public Long getId() {
